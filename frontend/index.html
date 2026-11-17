@@ -1,0 +1,102 @@
+<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>콘서트장 협업</title><meta name="viewport" content="width=device-width,initial-scale=1"><style>
+*{box-sizing:border-box}html,body{padding:0;margin:0;width:100%;height:100%;overflow:hidden;background:#f8fbf8}
+#lesson{width:100%;height:100%;border:0;display:block}
+@media(prefers-color-scheme:dark){html,body{background:#131c17}}
+</style></head><body>
+<iframe id="lesson" title="콘서트장 학습" sandbox="allow-same-origin allow-scripts allow-forms allow-modals allow-downloads allow-popups allow-popups-to-escape-sandbox"></iframe>
+<script>
+const tell=(type,more)=>window.parent.postMessage({isStreamlitMessage:true,type,...more},'*');
+let template=null,activeContext=null,currentUser=null,currentGroupInfo=null,version=-1,pending=new Map(),debounce=null,remotePending=null,lastTouch=0,installed=false;
+let sequence=0;function send(v){tell('streamlit:setComponentValue',{value:{...v,event_id:String(Date.now())+'_'+(++sequence)},dataType:'json'})}
+function notifyChanges(){if(!pending.size)return;const patch=Object.fromEntries(pending);pending.clear();send({type:'save',patch,context:activeContext})}
+function getDiff(before,after,path=[],result=[]){
+ if(JSON.stringify(before)===JSON.stringify(after))return result;
+ if(before&&after&&typeof before==='object'&&typeof after==='object'&&Array.isArray(before)===Array.isArray(after)){
+   if(Array.isArray(before)){if(before.length!==after.length){result.push({path,value:after});return result}
+     for(let i=0;i<after.length;i++)getDiff(before[i],after[i],[...path,i],result);
+   } else {for(const k of new Set([...Object.keys(before),...Object.keys(after)])){
+       if(!(k in after))result.push({path:[...path,k],delete:true});else getDiff(before[k],after[k],[...path,k],result);
+     }}
+ }else result.push({path,value:after});
+ return result;
+}
+function encodeBoot(args){
+ const user=JSON.stringify(args.user).replaceAll('<','\\u003c');
+ const context=JSON.stringify(args.context).replaceAll('<','\\u003c');
+ const entries=JSON.stringify(args.snapshot||{}).replaceAll('<','\\u003c');
+ const group=JSON.stringify(args.groupInfo||{}).replaceAll('<','\\u003c');
+ return `<script>(function(){
+ const user=${user},context=${context},entries=${entries},group=${group};
+ const prefix=context==='personal'?'gc-profile:'+encodeURIComponent(user)+':':'gc-shared:';
+ window.gcUser=user;window.accountStorageKey=key=>prefix+key;
+ window.gcLogOut=()=>window.parent.postMessage({concertBridge:true,type:'logout'},'*');
+ document.documentElement.classList.add('gc-authenticated');
+ for(let i=localStorage.length-1;i>=0;i--){const k=localStorage.key(i);if(k&&k.startsWith(prefix))localStorage.removeItem(k)}
+ for(const [k,v] of Object.entries(entries))if(k.startsWith(prefix))localStorage.setItem(k,v);
+ let hydrating=false; const original=Storage.prototype.setItem,remove=Storage.prototype.removeItem;
+ const push=(key,oldValue,newValue)=>{if(hydrating||!key.startsWith(prefix))return;
+   window.parent.postMessage({concertBridge:true,type:'change',key,oldValue,newValue},'*');};
+ Storage.prototype.setItem=function(k,v){const old=this.getItem(k);original.call(this,k,v);if(this===localStorage&&old!==String(v))push(String(k),old,String(v))};
+ Storage.prototype.removeItem=function(k){const old=this.getItem(k);remove.call(this,k);if(this===localStorage&&old!==null)push(String(k),old,null)};
+ window.gcApplyServerSnapshot=function(snapshot){hydrating=true;for(let i=localStorage.length-1;i>=0;i--){const k=localStorage.key(i);if(k&&k.startsWith(prefix))remove.call(localStorage,k)}
+ for(const [k,v] of Object.entries(snapshot))if(k.startsWith(prefix))original.call(localStorage,k,v);hydrating=false;};
+ window.gcShowGroupMessage=window.gcShowGroupMessage||(()=>{});
+ window.gcGroupBoot=group;
+ document.addEventListener('input',()=>window.parent.postMessage({concertBridge:true,type:'typing'},'*'),{capture:true});
+ window.addEventListener('load',()=>{window.gcRenderGroupManager?.(window.gcGroupBoot)});
+})();<\/script>`;
+}
+function mount(args){if(!template)return;const frame=document.getElementById('lesson');activeContext=args.context;currentUser=args.user;currentGroupInfo=args.groupInfo;version=args.version??0;installed=true;pending.clear();remotePending=null;
+ frame.srcdoc=template.replace('<body>','<body>'+encodeBoot(args));}
+function applyRemote(args){if(!installed)return; currentGroupInfo=args.groupInfo; const frame=document.getElementById('lesson');
+ try{frame.contentWindow.gcRenderGroupManager?.(args.groupInfo||{});}catch(e){}
+ if((args.version??0)<=version)return;
+ version=args.version;remotePending=args.snapshot||{};tryReload();
+}
+function tryReload(){if(!remotePending||pending.size)return;
+ if(Date.now()-lastTouch<3400)return;
+ const frame=document.getElementById('lesson');try{
+   const doc=frame.contentDocument;
+   const activeTab=doc?.querySelector('.gc-workspace>.tabs .tab.active')?.dataset?.tab||'one';
+   const position=frame.contentWindow.scrollY||0;
+   const snapshot=remotePending;remotePending=null;
+   const bootArgs={user:currentUser,context:activeContext,snapshot,groupInfo:currentGroupInfo};
+   frame.srcdoc=template.replace('<body>','<body>'+encodeBoot(bootArgs));
+   frame.onload=()=>{try{
+     const inner=frame.contentDocument;
+     const target=inner.querySelector('.gc-workspace>.tabs .tab[data-tab="'+activeTab+'"]');
+     target?.click();frame.contentWindow.scrollTo(0,position);
+   }catch(e){}};
+ }catch(e){console.error('협업 데이터 동기화:',e)}
+}
+window.addEventListener('message',event=>{
+ const frame=document.getElementById('lesson');
+ if(event.data?.concertBridge&&event.source===frame.contentWindow){
+  const d=event.data;
+  if(d.type==='logout'){clearTimeout(debounce);const patch=Object.fromEntries(pending);pending.clear();send({type:'logout',context:activeContext,patch});return}
+  if(d.type==='typing'){lastTouch=Date.now();return}
+  if(d.type==='group_action'){clearTimeout(debounce);const patch=Object.fromEntries(pending);pending.clear();send({type:'group_action',action:d.action,detail:d.detail,context:activeContext,patch});return}
+  if(d.type==='change'){
+   lastTouch=Date.now();
+   let change=d.newValue;
+   if(d.newValue!==null&&d.oldValue!==null){try{const old=JSON.parse(d.oldValue),neu=JSON.parse(d.newValue);if(old&&neu&&typeof old==='object'&&typeof neu==='object'){
+      change={kind:'json_ops',ops:getDiff(old,neu)};
+   }}catch(e){}}
+   // Aggregate field operations for the same key until debounce flush.
+   const previous=pending.get(d.key);
+   if(previous?.kind==='json_ops'&&change?.kind==='json_ops')previous.ops.push(...change.ops);
+   else pending.set(d.key,change);
+   clearTimeout(debounce);debounce=setTimeout(notifyChanges,520);
+   return;
+  }
+  return;
+ }
+ if(event.data?.type==='streamlit:render'){
+  const args=event.data.args||{};if(!args.user)return;
+  if(!template)return;
+  if(!installed||activeContext!==args.context)mount(args);else applyRemote(args);
+ }
+});
+setInterval(tryReload,800);
+fetch('student.html',{cache:'no-store'}).then(r=>r.text()).then(t=>{template=t;tell('streamlit:componentReady',{apiVersion:1});tell('streamlit:setFrameHeight',{height:850});}).catch(e=>{document.body.textContent='웹앱 불러오기 실패: '+e.message});
+</script></body></html>
